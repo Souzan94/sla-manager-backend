@@ -1,0 +1,110 @@
+name: Deploy to slaapp.test
+
+on:
+  push:
+    branches:
+      - development
+
+jobs:
+  deploy:
+    environment: test
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_PATH: /var/www/slaapp.test
+      RELEASE_ID: release-${{ github.run_number }}-${{ github.sha }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Prepare server
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          port: 2220
+          envs: DEPLOY_PATH,RELEASE_ID
+          script: |
+            # Ensure base directories exist
+            mkdir -p $DEPLOY_PATH/{releases,logs,rollback}
+
+            # Store current release info for potential rollback idle
+            if [ -L "$DEPLOY_PATH/current" ]; then
+              CURRENT_RELEASE=$(readlink $DEPLOY_PATH/current)
+              echo $CURRENT_RELEASE > $DEPLOY_PATH/rollback/last_successful_release
+            fi
+
+            # Create new release directory
+            RELEASE_DIR=$DEPLOY_PATH/releases/$RELEASE_ID
+            mkdir -p $RELEASE_DIR
+            echo "Created release directory: $RELEASE_DIR"
+
+      - name: Copy release to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          port: 2220
+          source: "*"
+          target: "${{ env.DEPLOY_PATH }}/releases/${{ env.RELEASE_ID }}"
+          strip_components: 0
+
+      - name: Deploy and validate
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          port: 2220
+          envs: DEPLOY_PATH,RELEASE_ID
+          script: |
+            set -e # Exit on any error
+
+            cd $DEPLOY_PATH/releases/$RELEASE_ID
+
+            bash deploy.sh
+
+            echo "Updating current symlink..."
+            ln -sfn $DEPLOY_PATH/releases/$RELEASE_ID $DEPLOY_PATH/current
+
+            cp $DEPLOY_PATH/.env $DEPLOY_PATH/current
+
+            # Set correct permissions for Nginx
+            echo "Setting correct permissions for Nginx..."
+            sudo chown -R www-data:www-data $DEPLOY_PATH/releases/$RELEASE_ID
+            sudo chmod -R 775 $DEPLOY_PATH/releases/$RELEASE_ID
+
+            # Start/reload the application with error handling
+            cd $DEPLOY_PATH/current
+            PM2_ERROR=0
+
+            if pm2 list | grep -q "zendesk-sla-app-test"; then
+              echo "Reloading application..."
+              pm2 restart ecosystem.config.js --only zendesk-sla-app-test --env development || PM2_ERROR=$?
+            else
+              echo "Starting application..."
+              pm2 start ecosystem.config.js --only zendesk-sla-app-test --env development || PM2_ERROR=$?
+            fi
+
+            if [ $PM2_ERROR -ne 0 ]; then
+              echo "PM2 operation failed with error code: $PM2_ERROR"
+            fi
+
+            # Wait for the app to stabilize
+            sleep 5
+
+            # Check if the process is running
+            if ! pm2 describe slaapp.test > /dev/null 2>&1; then
+              echo "Application failed to start properly"
+            fi
+
+            # Save PM2 process list
+            pm2 save
+
+            echo "Deployment validated successfully!"
+
+            # Cleanup old releases (keep last 5)
+            cd $DEPLOY_PATH/releases
+            ls -1dt */ | tail -n +4 | xargs -r rm -rf
